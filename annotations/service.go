@@ -43,72 +43,138 @@ func NewService(logger *zap.Logger, store *sqlite.SqlStore) *Service {
 	}
 }
 
-// this will need some work. should be able to batch inserts using sqlx.
 func (s *Service) CreateAnnotations(ctx context.Context, orgID platform.ID, creates []influxdb.AnnotationCreate) ([]influxdb.AnnotationEvent, error) {
 	s.store.Mu.Lock()
 	defer s.store.Mu.Unlock()
 
-	events := make([]influxdb.AnnotationEvent, 0, len(creates))
+	// we need to create annotations with their stream_id set to whatever it needs to be
+	// streams will need to be created if they don't exist
 
-	// store a unique list of stream names first
+	// store a unique list of stream names first. the invalid ID is a placeholder for the real id
 	streams := make(map[string]platform.ID)
 	for _, c := range creates {
 		streams[c.StreamTag] = platform.InvalidID()
 	}
 
-	// gonna need to get that into a list of ids. the keys are actually names. awesome!
+	upsertQuery := `
+		INSERT INTO streams(id, org_id, name, description, created_at, updated_at)
+		VALUES(:id, :org_id, :name, :description, :created_at, :updated_at)
+		ON CONFLICT(org_id, name) DO 
+			UPDATE SET updated_at = :updated_at
+			WHERE org_id = :org_id AND name = :name
+		RETURNING id`
+
+	tx, err := s.store.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+
+	nowTime := time.Now().UTC()
+
 	for name := range streams {
-		// this might create a new stream, but probably just won't do anything other than a pointless database query
-		s, err := s.CreateOrUpdateStream(ctx, orgID, influxdb.Stream{Name: name})
+		upsertStmt, err := tx.PrepareNamedContext(ctx, upsertQuery)
 		if err != nil {
+			tx.Rollback()
 			return nil, err
 		}
 
-		// now we know the stream ID so set that
-		streams[name] = s.ID
-	}
-
-	for _, c := range creates {
-		a := influxdb.StoredAnnotation{
-			ID:        s.idGenerator.ID(),
+		newID := s.idGenerator.ID()
+		var id platform.ID
+		if err := upsertStmt.GetContext(ctx, &id, influxdb.StoredStream{
+			ID:        newID,
 			OrgID:     orgID,
-			StreamID:  streams[c.StreamTag],
-			StreamTag: c.StreamTag,
-			Summary:   c.Summary,
-			Message:   c.Message,
-			Stickers:  stickerMapToSlice(c.Stickers),
-			Duration:  fmt.Sprintf("[%s, %s]", c.StartTime.Format(time.RFC3339Nano), c.EndTime.Format(time.RFC3339Nano)),
-			Lower:     c.EndTime.Format(time.RFC3339Nano),
-			Upper:     c.StartTime.Format(time.RFC3339Nano),
-		}
-
-		query := `
-			INSERT INTO annotations(id, org_id, stream_id, stream_tag, summary, message, stickers, duration, lower, upper)
-			VALUES (:id, :org_id, :stream_id, :stream_tag, :summary, :message, :stickers, :duration, :lower, :upper)
-			RETURNING id, stream_tag, summary, message, stickers, lower, upper
-		`
-
-		stmt, err := s.store.DB.PrepareNamedContext(ctx, query)
-		if err != nil {
+			Name:      name,
+			CreatedAt: nowTime,
+			UpdatedAt: nowTime,
+		}); err != nil {
+			tx.Rollback()
 			return nil, err
 		}
 
-		annEvent := influxdb.AnnotationEvent{}
-		if err := stmt.Get(&annEvent, a); err != nil {
-			return nil, err
-		}
-
-		events = append(events, annEvent)
+		streams[name] = id
 	}
 
-	return events, nil
+	// now we can just create all the annotations
+	createdEvents := make([]influxdb.AnnotationEvent, 0, len(creates))
+	for _, create := range creates {
+		// double check that we have a valid name for this stream tag
+		streamID, ok := streams[create.StreamTag]
+		if !ok {
+			tx.Rollback()
+			return nil, &ierrors.Error{
+				Code: ierrors.EInternal,
+				Msg:  fmt.Sprintf("unable to find id for stream %q", create.StreamTag),
+			}
+		}
+
+		annotationInsertQuery := `
+			INSERT INTO annotations(id, org_id, stream_id, name, summary, message, stickers, duration, lower, upper)
+			VALUES(:id, :org_id, :stream_id, :name, :summary, :message, :stickers, :duration, :lower, :upper)
+			RETURNING id, name, summary, message, stickers, lower, upper`
+
+		stmt, err := tx.PrepareNamedContext(ctx, annotationInsertQuery)
+		if err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+
+		newID := s.idGenerator.ID()
+		var res influxdb.StoredAnnotation
+		if err := stmt.GetContext(ctx, &res, influxdb.StoredAnnotation{
+			ID:        newID,
+			OrgID:     orgID,
+			StreamID:  streamID,
+			StreamTag: create.StreamTag,
+			Summary:   create.Summary,
+			Message:   create.Message,
+			Stickers:  create.Stickers,
+			Duration:  fmt.Sprintf("[%s, %s]", create.StartTime.Format(time.RFC3339Nano), create.EndTime.Format(time.RFC3339Nano)),
+			Lower:     create.StartTime.Format(time.RFC3339Nano),
+			Upper:     create.StartTime.Format(time.RFC3339Nano),
+		}); err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+
+		st, err := time.Parse(time.RFC3339Nano, res.Lower)
+		if err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+
+		et, err := time.Parse(time.RFC3339Nano, res.Upper)
+		if err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+
+		createdEvents = append(createdEvents, influxdb.AnnotationEvent{
+			ID: res.ID,
+			AnnotationCreate: influxdb.AnnotationCreate{
+				StreamTag: res.StreamTag,
+				Summary:   res.Summary,
+				Message:   res.Message,
+				Stickers:  res.Stickers,
+				EndTime:   &et,
+				StartTime: &st,
+			},
+		})
+	}
+
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return createdEvents, nil
 }
 
 func (s *Service) ListAnnotations(ctx context.Context, orgID platform.ID, filter influxdb.AnnotationListFilter) ([]influxdb.StoredAnnotation, error) {
+
+
 	return nil, nil
 }
 
-// GetAnnotation checks to see if the authorizer on context has read access to the requested annotation
 func (s *Service) GetAnnotation(ctx context.Context, id platform.ID) (*influxdb.StoredAnnotation, error) {
 	return nil, nil
 }

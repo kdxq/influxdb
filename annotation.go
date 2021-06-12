@@ -2,6 +2,7 @@ package influxdb
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"regexp"
 	"strings"
@@ -101,26 +102,49 @@ type AnnotationEvent struct {
 
 // AnnotationCreate contains user providable fields for annotating an event.
 type AnnotationCreate struct {
-	StreamTag string            `json:"stream,omitempty"`    // StreamTag provides a means to logically group a set of annotated events.
-	Summary   string            `json:"summary"`             // Summary is the only field required to annotate an event.
-	Message   string            `json:"message,omitempty"`   // Message provides more details about the event being annotated.
-	Stickers  map[string]string `json:"stickers,omitempty"`  // Stickers are like tags, but named something obscure to differentiate them from influx tags. They are there to differentiate an annotated event.
-	EndTime   *time.Time        `json:"endTime,omitempty"`   // EndTime is the time of the event being annotated. Defaults to now if not set.
-	StartTime *time.Time        `json:"startTime,omitempty"` // StartTime is the start time of the event being annotated. Defaults to EndTime if not set.
+	StreamTag string             `json:"stream,omitempty"`    // StreamTag provides a means to logically group a set of annotated events.
+	Summary   string             `json:"summary"`             // Summary is the only field required to annotate an event.
+	Message   string             `json:"message,omitempty"`   // Message provides more details about the event being annotated.
+	Stickers  AnnotationStickers `json:"stickers,omitempty"`  // Stickers are like tags, but named something obscure to differentiate them from influx tags. They are there to differentiate an annotated event.
+	EndTime   *time.Time         `json:"endTime,omitempty"`   // EndTime is the time of the event being annotated. Defaults to now if not set.
+	StartTime *time.Time         `json:"startTime,omitempty"` // StartTime is the start time of the event being annotated. Defaults to EndTime if not set.
 }
 
 // StoredAnnotation represents annotation data to be stored in the database.
 type StoredAnnotation struct {
-	ID        platform.ID `db:"id"`        // ID is the annotation's id.
-	OrgID     platform.ID `db:"org_id"`    // OrgID is the annotations's owning organization.
-	StreamID  platform.ID `db:"stream_id"` // StreamID is the id of a stream.
-	StreamTag string      `db:"name"`      // StreamTag is the name of a stream (when selecting with join of streams).
-	Summary   string      `db:"summary"`   // Summary is the summary of the annotated event.
-	Message   string      `db:"message"`   // Message is a longer description of the annotated event.
-	Stickers  []string    `db:"stickers"`  // Stickers are additional labels to group annotations by.
-	Duration  string      `db:"duration"`  // Duration is the time range (with zone) of an annotated event.
-	Lower     string      `db:"lower"`     // Lower is the time an annotated event begins.
-	Upper     string      `db:"upper"`     // Upper is the time an annotated event ends.
+	ID        platform.ID        `db:"id"`        // ID is the annotation's id.
+	OrgID     platform.ID        `db:"org_id"`    // OrgID is the annotations's owning organization.
+	StreamID  platform.ID        `db:"stream_id"` // StreamID is the id of a stream.
+	StreamTag string             `db:"name"`      // StreamTag is the name of a stream (when selecting with join of streams).
+	Summary   string             `db:"summary"`   // Summary is the summary of the annotated event.
+	Message   string             `db:"message"`   // Message is a longer description of the annotated event.
+	Stickers  AnnotationStickers `db:"stickers"`  // Stickers are additional labels to group annotations by.
+	Duration  string             `db:"duration"`  // Duration is the time range (with zone) of an annotated event.
+	Lower     string             `db:"lower"`     // Lower is the time an annotated event begins.
+	Upper     string             `db:"upper"`     // Upper is the time an annotated event ends.
+}
+
+type AnnotationStickers map[string]string
+
+// Value implements the database/sql Valuer interface for adding AnnotationStickers to the database.
+func (a AnnotationStickers) Value() (driver.Value, error) {
+	sticks, err := json.Marshal(a)
+	if err != nil {
+		return nil, err
+	}
+
+	return string(sticks), nil
+}
+
+// Scan implements the database/sql Scanner interface for retrieving AnnotationStickers from the database.
+func (a *AnnotationStickers) Scan(value interface{}) error {
+	var sticks AnnotationStickers
+	if err := json.NewDecoder(strings.NewReader(value.(string))).Decode(&sticks); err != nil {
+		return err
+	}
+
+	*a = sticks
+	return nil
 }
 
 // Validate validates the creation object.

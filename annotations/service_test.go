@@ -2,7 +2,9 @@ package annotations
 
 import (
 	"context"
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/influxdata/influxdb/v2"
 	"github.com/influxdata/influxdb/v2/kit/platform"
@@ -169,6 +171,50 @@ func TestStreamsCRUDMany(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []influxdb.StoredStream{}, got)
 	}
+}
+
+func TestCreateAnnotations(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	nowFunc := func() time.Time {
+		return now
+	}
+
+	svc, clean := newTestService(t)
+	defer clean(t)
+
+	orgID := *influxdbtesting.IDPtr(1)
+	ctx := context.Background()
+
+	c1 := influxdb.AnnotationCreate{
+		StreamTag: "stream1",
+		Summary:   "summary1",
+		Message:   "message1",
+		Stickers:  map[string]string{"stick1": "val1", "stick2": "val2"},
+	}
+	c1.Validate(nowFunc)
+
+	c2 := influxdb.AnnotationCreate{
+		StreamTag: "stream2",
+		Summary:   "summary2",
+		Message:   "message2",
+		Stickers:  map[string]string{"stick1": "val1", "stick2": "val2"},
+	}
+	c2.Validate(nowFunc)
+
+	testCreates := []influxdb.AnnotationCreate{c1, c2}
+	got, err := svc.CreateAnnotations(ctx, orgID, testCreates)
+	require.NoError(t, err)
+
+	sort.Slice(got, func(i, j int) bool {
+		return got[i].StreamTag < got[j].StreamTag
+	})
+
+	require.Equal(t, got[0].StreamTag, c1.StreamTag)
+	require.Equal(t, got[1].StreamTag, c2.StreamTag)
+	require.Equal(t, got[0].StartTime, &now)
+	require.Equal(t, got[1].StartTime, &now)
 }
 
 func TestCascadeStreamDelete(t *testing.T) {
