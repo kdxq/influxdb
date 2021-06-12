@@ -2,8 +2,6 @@ package annotations
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 
@@ -200,18 +198,18 @@ func (s *Service) UpdateStream(ctx context.Context, id platform.ID, stream influ
 		UpdatedAt:   nowTime,
 	}
 
-	_, err := s.store.DB.NamedExecContext(ctx, query, &u)
+	rows, err := s.store.DB.NamedExecContext(ctx, query, u)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errStreamNotFound
-		}
-
 		return nil, err
 	}
 
-	// do a separate query to get the resulting record from the db.
-	// this is necessary because scanning strings from the db into time.Time types
-	// from the RETURNING clause does not work, but scanning them with a SELECT does.
+	n, err := rows.RowsAffected()
+	if err != nil {
+		return nil, err
+	} else if n == 0 {
+		return nil, errStreamNotFound
+	}
+
 	return s.getReadStream(ctx, id)
 }
 

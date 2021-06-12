@@ -5,11 +5,16 @@ import (
 	"testing"
 
 	"github.com/influxdata/influxdb/v2"
+	"github.com/influxdata/influxdb/v2/snowflake"
 	"github.com/influxdata/influxdb/v2/sqlite"
 	"github.com/influxdata/influxdb/v2/sqlite/migrations"
 	influxdbtesting "github.com/influxdata/influxdb/v2/testing"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+)
+
+var (
+	idGen = snowflake.NewIDGenerator()
 )
 
 func TestCreateOrUpdateStream(t *testing.T) {
@@ -38,13 +43,29 @@ func TestCreateOrUpdateStream(t *testing.T) {
 		Description: "updated description",
 	}
 
-	s2, err := svc.CreateOrUpdateStream(ctx, orgID, update)
+	s2, err := svc.CreateOrUpdateStream(ctx, orgID, u1)
 	require.NoError(t, err)
 	require.Equal(t, stream.Name, s2.Name)
 	require.Equal(t, u1.Description, s2.Description)
 	require.Equal(t, s1.ID, s2.ID)
 
-	//
+	u2 := influxdb.Stream{
+		Name:        "otherName",
+		Description: "other description",
+	}
+
+	// updating a non-existant stream with UpdateStream returns not found error
+	got, err := svc.UpdateStream(ctx, idGen.ID(), u2)
+	require.Nil(t, got)
+	require.Equal(t, errStreamNotFound, err)
+
+	// can update an existing stream with UpdateStream, changing both the name and description
+	s3, err := svc.UpdateStream(ctx, s2.ID, u2)
+	require.NoError(t, err)
+	require.Equal(t, s2.ID, s3.ID)
+	require.Equal(t, u2.Name, s3.Name)
+	require.Equal(t, u2.Description, s3.Description)
+
 }
 
 func newTestService(t *testing.T) (*Service, func(t *testing.T)) {
