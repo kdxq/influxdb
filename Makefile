@@ -22,12 +22,12 @@ export GOARCH=$(shell go env GOARCH)
 ifneq (,$(filter $(GOARCH),amd64 s390x))
 	# Including the assets tag requires the UI to be built for compilation to succeed.
 	# Don't force it for running tests.
-	GO_TEST_TAGS :=
-	GO_BUILD_TAGS := assets
+	GO_TEST_TAGS :=sqlite_foreign_keys
+	GO_BUILD_TAGS := assets,sqlite_foreign_keys
 else
 	# noasm needed to avoid a panic in Flux for non-amd64, non-s390x.
-	GO_TEST_TAGS := noasm
-	GO_BUILD_TAGS := assets,noasm
+	GO_TEST_TAGS := noasm,sqlite_foreign_keys
+	GO_BUILD_TAGS := assets,noasm,sqlite_foreign_keys
 endif
 
 GO_TEST_ARGS := -tags '$(GO_TEST_TAGS)'
