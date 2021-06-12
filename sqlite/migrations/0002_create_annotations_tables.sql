@@ -16,7 +16,7 @@ CREATE TABLE streams (
 
 -- Create the initial table to store annotations
 CREATE TABLE annotations (
-  id VARCHAR(16) NOT NULL,
+  id VARCHAR(16) UNIQUE NOT NULL,
   org_id VARCHAR(16) NOT NULL,
   stream_id VARCHAR(16) NOT NULL,
   name TEXT NOT NULL,
