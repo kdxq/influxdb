@@ -282,12 +282,6 @@ func (f *AnnotationListFilter) SetStickerIncludes(vals map[string][]string) {
 // StreamListFilter is a selection filter for listing streams. Streams are not considered first class resources, but depend on an annotation using them.
 type StreamListFilter struct {
 	StreamIncludes []string `json:"streamIncludes,omitempty"` // StreamIncludes allows the user to filter streams returned.
-	BasicFilter
-}
-
-// Validate validates the filter.
-func (f *StreamListFilter) Validate(nowFunc func() time.Time) error {
-	return f.BasicFilter.Validate(nowFunc)
 }
 
 // Stream defines the stream metadata. Used in create and update requests/responses. Delete requests will only require stream name.

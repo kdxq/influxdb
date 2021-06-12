@@ -2,6 +2,8 @@ package annotations
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	ierrors "github.com/influxdata/influxdb/v2/kit/platform/errors"
 	"github.com/influxdata/influxdb/v2/snowflake"
 	"github.com/influxdata/influxdb/v2/sqlite"
+	"github.com/jmoiron/sqlx"
 	"go.uber.org/zap"
 )
 
@@ -122,17 +125,60 @@ func (s *Service) UpdateAnnotation(ctx context.Context, id platform.ID, update i
 	return nil, nil
 }
 
+// List streams list the stream named in the filter for the provided org.
 func (s *Service) ListStreams(ctx context.Context, orgID platform.ID, filter influxdb.StreamListFilter) ([]influxdb.StoredStream, error) {
-	return nil, nil
+	query := `
+		SELECT id, org_id, name, description, created_at, updated_at FROM streams
+		WHERE org_id = ?`
+
+	// if there are no stream names specified, the default behavior is to return all streams for the org
+	if len(filter.StreamIncludes) == 0 {
+		return s.listStreamsFromQueryAndArgs(ctx, query, orgID)
+	}
+
+	// note the leading space in this string, this is required!
+	query += ` AND name IN (?)`
+	query, args, err := sqlx.In(query, orgID, filter.StreamIncludes)
+	if err != nil {
+		return nil, err
+	}
+	query = s.store.DB.Rebind(query)
+
+	return s.listStreamsFromQueryAndArgs(ctx, query, args...)
+}
+
+// listStreamsFromQueryAndArgs is a helper function for selecting a list of streams in a generalized way
+func (s *Service) listStreamsFromQueryAndArgs(ctx context.Context, query string, args ...interface{}) ([]influxdb.StoredStream, error) {
+	sts := []influxdb.StoredStream{}
+	err := s.store.DB.SelectContext(ctx, &sts, query, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	return sts, nil
 }
 
 func (s *Service) GetStream(ctx context.Context, id platform.ID) (*influxdb.StoredStream, error) {
-	return nil, nil
+	var st influxdb.StoredStream
+
+	query := `
+		SELECT id, org_id, name, description, created_at, updated_at
+		FROM streams WHERE id = $1`
+
+	if err := s.store.DB.GetContext(ctx, &st, query, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errStreamNotFound
+		}
+
+		return nil, err
+	}
+
+	return &st, nil
 }
 
 // CreateOrUpdateStream creates a new stream, or updates the description to an existing stream.
 // Inputs should be validated prior to call.
-// Doesn't support updating a stream desctription to "" - consistent with cloud
+// Doesn't support updating a stream desctription to "". For that use the UpdateStream method.
 func (s *Service) CreateOrUpdateStream(ctx context.Context, orgID platform.ID, stream influxdb.Stream) (*influxdb.ReadStream, error) {
 	s.store.Mu.Lock()
 	defer s.store.Mu.Unlock()
@@ -146,11 +192,9 @@ func (s *Service) CreateOrUpdateStream(ctx context.Context, orgID platform.ID, s
 		RETURNING id`
 
 	setStr := "updated_at = :updated_at"
-
 	if len(stream.Description) > 0 {
 		setStr += ",description = :description"
 	}
-
 	upsertQuery = fmt.Sprintf(upsertQuery, setStr)
 
 	stmt, err := s.store.DB.PrepareNamedContext(ctx, upsertQuery)
@@ -214,10 +258,50 @@ func (s *Service) UpdateStream(ctx context.Context, id platform.ID, stream influ
 }
 
 func (s *Service) DeleteStreams(ctx context.Context, orgID platform.ID, delete influxdb.BasicStream) error {
+	s.store.Mu.Lock()
+	defer s.store.Mu.Unlock()
+
+	query := `
+		DELETE FROM streams
+		WHERE org_id = ? AND name IN (?)`
+
+	query, args, err := sqlx.In(query, orgID, delete.Names)
+	if err != nil {
+		return err
+	}
+	query = s.store.DB.Rebind(query)
+
+	_, err = s.store.DB.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
+// DeleteStreamByID deletes a single stream by ID
 func (s *Service) DeleteStreamByID(ctx context.Context, id platform.ID) error {
+	s.store.Mu.Lock()
+	defer s.store.Mu.Unlock()
+
+	query := `
+		DELETE FROM streams
+		WHERE id = ?`
+
+	res, err := s.store.DB.ExecContext(ctx, query, id.String())
+	if err != nil {
+		return err
+	}
+
+	r, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if r == 0 {
+		return errStreamNotFound
+	}
+
 	return nil
 }
 
@@ -226,7 +310,7 @@ func (s *Service) DeleteStreamByID(ctx context.Context, id platform.ID) error {
 func (s *Service) getReadStream(ctx context.Context, id platform.ID) (*influxdb.ReadStream, error) {
 	query := `
 		SELECT id, name, description, created_at, updated_at
-		FROM streams WHERE id = $1`
+		FROM streams WHERE id = ?`
 
 	r := &influxdb.ReadStream{}
 	if err := s.store.DB.GetContext(ctx, r, query, id); err != nil {
