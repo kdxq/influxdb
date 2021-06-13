@@ -2,6 +2,7 @@ package annotations
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"testing"
 	"time"
@@ -173,13 +174,14 @@ func TestStreamsCRUDMany(t *testing.T) {
 	}
 }
 
-func TestCreateAnnotations(t *testing.T) {
+func TestCreateAndListAnnotations(t *testing.T) {
 	t.Parallel()
 
-	now := time.Now().UTC()
-	nowFunc := func() time.Time {
-		return now
-	}
+	et1 := time.Now().UTC()
+	st1 := et1.Add(-10 * time.Minute)
+
+	et2 := et1.Add(-5 * time.Minute)
+	st2 := et2.Add(-10 * time.Minute)
 
 	svc, clean := newTestService(t)
 	defer clean(t)
@@ -187,49 +189,170 @@ func TestCreateAnnotations(t *testing.T) {
 	orgID := *influxdbtesting.IDPtr(1)
 	ctx := context.Background()
 
-	c1 := influxdb.AnnotationCreate{
+	s1 := influxdb.StoredAnnotation{
+		OrgID:     orgID,
 		StreamTag: "stream1",
 		Summary:   "summary1",
 		Message:   "message1",
 		Stickers:  map[string]string{"stick1": "val1", "stick2": "val2"},
+		Duration:  fmt.Sprintf("[%s, %s]", st1.Format(time.RFC3339Nano), et1.Format(time.RFC3339Nano)),
+		Lower:     st1.Format(time.RFC3339Nano),
+		Upper:     et1.Format(time.RFC3339Nano),
 	}
-	c1.Validate(nowFunc)
 
-	c2 := influxdb.AnnotationCreate{
+	c1, err := s1.ToCreate()
+	require.NoError(t, err)
+
+	s2 := influxdb.StoredAnnotation{
+		OrgID:     orgID,
 		StreamTag: "stream2",
 		Summary:   "summary2",
 		Message:   "message2",
-		Stickers:  map[string]string{"stick1": "val1", "stick2": "val2"},
+		Stickers:  map[string]string{"stick2": "val2", "stick3": "val3", "stick4": "val4"},
+		Duration:  fmt.Sprintf("[%s, %s]", st2.Format(time.RFC3339Nano), et2.Format(time.RFC3339Nano)),
+		Lower:     st2.Format(time.RFC3339Nano),
+		Upper:     et2.Format(time.RFC3339Nano),
 	}
-	c2.Validate(nowFunc)
 
-	testCreates := []influxdb.AnnotationCreate{c1, c2}
-	got, err := svc.CreateAnnotations(ctx, orgID, testCreates)
+	c2, err := s2.ToCreate()
 	require.NoError(t, err)
 
-	sort.Slice(got, func(i, j int) bool {
-		return got[i].StreamTag < got[j].StreamTag
-	})
+	testCreates := []influxdb.AnnotationCreate{*c1, *c2}
+	got, err := svc.CreateAnnotations(ctx, orgID, testCreates)
+	require.NoError(t, err)
+	require.ElementsMatch(t, testCreates, []influxdb.AnnotationCreate{got[0].AnnotationCreate, got[1].AnnotationCreate})
 
-	require.Equal(t, got[0].StreamTag, c1.StreamTag)
-	require.Equal(t, got[1].StreamTag, c2.StreamTag)
-	require.Equal(t, got[0].StartTime, &now)
-	require.Equal(t, got[1].StartTime, &now)
+	t.Run("select with filters", func(t *testing.T) {
+		earlierEt1 := et1.Add(-1 * time.Millisecond)
+		laterSt2 := st2.Add(1 * time.Millisecond)
+		impossibleTime := time.Time{}.Add(1 * time.Minute)
+
+		tests := []struct {
+			name string
+			f    influxdb.AnnotationListFilter
+			want []influxdb.StoredAnnotation
+		}{
+			{
+				"time filter is inclusive",
+				influxdb.AnnotationListFilter{
+					BasicFilter: influxdb.BasicFilter{
+						StartTime: &st2,
+						EndTime:   &et1,
+					},
+				},
+				[]influxdb.StoredAnnotation{s1, s2},
+			},
+			{
+				"end time will filter out annotations",
+				influxdb.AnnotationListFilter{
+					BasicFilter: influxdb.BasicFilter{
+						StartTime: &st2,
+						EndTime:   &earlierEt1,
+					},
+				},
+				[]influxdb.StoredAnnotation{s2},
+			},
+			{
+				"start time will filter out annotations",
+				influxdb.AnnotationListFilter{
+					BasicFilter: influxdb.BasicFilter{
+						StartTime: &laterSt2,
+						EndTime:   &et1,
+					},
+				},
+				[]influxdb.StoredAnnotation{s1},
+			},
+			{
+				"time can filter out all annotations",
+				influxdb.AnnotationListFilter{
+					BasicFilter: influxdb.BasicFilter{
+						StartTime: &impossibleTime,
+						EndTime:   &impossibleTime,
+					},
+				},
+				[]influxdb.StoredAnnotation{},
+			},
+			{
+				"can filter by stickers - one sticker matches one",
+				influxdb.AnnotationListFilter{
+					StickerIncludes: map[string]string{"stick1": "val1"},
+				},
+				[]influxdb.StoredAnnotation{s1},
+			},
+			{
+				"can filter by stickers - one sticker matches multiple",
+				influxdb.AnnotationListFilter{
+					StickerIncludes: map[string]string{"stick2": "val2"},
+				},
+				[]influxdb.StoredAnnotation{s1, s2},
+			},
+			{
+				"can filter by stickers - matching key but wrong value",
+				influxdb.AnnotationListFilter{
+					StickerIncludes: map[string]string{"stick2": "val3"},
+				},
+				[]influxdb.StoredAnnotation{},
+			},
+			{
+				"can filter by stream - matches one",
+				influxdb.AnnotationListFilter{
+					StreamIncludes: []string{"stream2"},
+				},
+				[]influxdb.StoredAnnotation{s2},
+			},
+			{
+				"can filter by stream - no match",
+				influxdb.AnnotationListFilter{
+					StreamIncludes: []string{"badStream"},
+				},
+				[]influxdb.StoredAnnotation{},
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				tt.f.Validate(time.Now)
+				listed, err := svc.ListAnnotations(ctx, orgID, tt.f)
+				require.NoError(t, err)
+				assertStoredAnnotations(t, tt.want, listed)
+			})
+		}
+	})
 }
 
 func TestCascadeStreamDelete(t *testing.T) {
 
 }
 
-func assertStreamNames(t *testing.T, expectNames []string, streams []influxdb.StoredStream) {
+func assertStoredAnnotations(t *testing.T, want []influxdb.StoredAnnotation, got []influxdb.StoredAnnotation) {
 	t.Helper()
 
-	storedNames := make([]string, len(streams))
-	for i, s := range streams {
+	require.Equal(t, len(want), len(got))
+
+	sort.Slice(want, func(i, j int) bool {
+		return want[i].StreamTag < want[j].StreamTag
+	})
+
+	sort.Slice(got, func(i, j int) bool {
+		return got[i].StreamTag < got[j].StreamTag
+	})
+
+	for idx, w := range want {
+		w.ID = got[idx].ID
+		w.StreamID = got[idx].StreamID
+		require.Equal(t, w, got[idx])
+	}
+}
+
+func assertStreamNames(t *testing.T, want []string, got []influxdb.StoredStream) {
+	t.Helper()
+
+	storedNames := make([]string, len(got))
+	for i, s := range got {
 		storedNames[i] = s.Name
 	}
 
-	require.ElementsMatch(t, expectNames, storedNames)
+	require.ElementsMatch(t, want, storedNames)
 }
 
 func newTestService(t *testing.T) (*Service, func(t *testing.T)) {

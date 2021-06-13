@@ -24,8 +24,8 @@ CREATE TABLE annotations (
   message TEXT NOT NULL,
   stickers TEXT NOT NULL,
   duration TEXT NOT NULL,
-  lower TEXT NOT NULL,
-  upper TEXT NOT NULL,
+  lower TIMESTAMP NOT NULL,
+  upper TIMESTAMP NOT NULL,
     
   PRIMARY KEY ("id", "org_id"),
   FOREIGN KEY (stream_id) REFERENCES streams(id)

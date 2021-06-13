@@ -124,6 +124,27 @@ type StoredAnnotation struct {
 	Upper     string             `db:"upper"`     // Upper is the time an annotated event ends.
 }
 
+func (s StoredAnnotation) ToCreate() (*AnnotationCreate, error) {
+	et, err := time.Parse(time.RFC3339Nano, s.Upper)
+	if err != nil {
+		return nil, err
+	}
+
+	st, err := time.Parse(time.RFC3339Nano, s.Lower)
+	if err != nil {
+		return nil, err
+	}
+
+	return &AnnotationCreate{
+		StreamTag: s.StreamTag,
+		Summary:   s.Summary,
+		Message:   s.Message,
+		Stickers:  s.Stickers,
+		EndTime:   &et,
+		StartTime: &st,
+	}, nil
+}
+
 type AnnotationStickers map[string]string
 
 // Value implements the database/sql Valuer interface for adding AnnotationStickers to the database.
@@ -278,8 +299,8 @@ type ReadAnnotation struct {
 
 // AnnotationListFilter is a selection filter for listing annotations.
 type AnnotationListFilter struct {
-	StickerIncludes map[string]string `json:"stickerIncludes,omitempty"` // StickerIncludes allows the user to filter annotated events based on it's sticker.
-	StreamIncludes  []string          `json:"streamIncludes,omitempty"`  // StreamIncludes allows the user to filter annotated events by stream.
+	StickerIncludes AnnotationStickers `json:"stickerIncludes,omitempty"` // StickerIncludes allows the user to filter annotated events based on it's sticker.
+	StreamIncludes  []string           `json:"streamIncludes,omitempty"`  // StreamIncludes allows the user to filter annotated events by stream.
 	BasicFilter
 }
 

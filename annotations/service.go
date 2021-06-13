@@ -56,43 +56,20 @@ func (s *Service) CreateAnnotations(ctx context.Context, orgID platform.ID, crea
 		streams[c.StreamTag] = platform.InvalidID()
 	}
 
-	upsertQuery := `
-		INSERT INTO streams(id, org_id, name, description, created_at, updated_at)
-		VALUES(:id, :org_id, :name, :description, :created_at, :updated_at)
-		ON CONFLICT(org_id, name) DO 
-			UPDATE SET updated_at = :updated_at
-			WHERE org_id = :org_id AND name = :name
-		RETURNING id`
-
 	tx, err := s.store.DB.BeginTxx(ctx, nil)
 	if err != nil {
 		tx.Rollback()
 		return nil, err
 	}
 
-	nowTime := time.Now().UTC()
-
 	for name := range streams {
-		upsertStmt, err := tx.PrepareNamedContext(ctx, upsertQuery)
+		streamID, err := s.upsertStreamTx(ctx, tx, orgID, influxdb.Stream{Name: name})
 		if err != nil {
 			tx.Rollback()
 			return nil, err
 		}
 
-		newID := s.idGenerator.ID()
-		var id platform.ID
-		if err := upsertStmt.GetContext(ctx, &id, influxdb.StoredStream{
-			ID:        newID,
-			OrgID:     orgID,
-			Name:      name,
-			CreatedAt: nowTime,
-			UpdatedAt: nowTime,
-		}); err != nil {
-			tx.Rollback()
-			return nil, err
-		}
-
-		streams[name] = id
+		streams[name] = *streamID
 	}
 
 	// now we can just create all the annotations
@@ -131,7 +108,7 @@ func (s *Service) CreateAnnotations(ctx context.Context, orgID platform.ID, crea
 			Stickers:  create.Stickers,
 			Duration:  fmt.Sprintf("[%s, %s]", create.StartTime.Format(time.RFC3339Nano), create.EndTime.Format(time.RFC3339Nano)),
 			Lower:     create.StartTime.Format(time.RFC3339Nano),
-			Upper:     create.StartTime.Format(time.RFC3339Nano),
+			Upper:     create.EndTime.Format(time.RFC3339Nano),
 		}); err != nil {
 			tx.Rollback()
 			return nil, err
@@ -169,10 +146,99 @@ func (s *Service) CreateAnnotations(ctx context.Context, orgID platform.ID, crea
 	return createdEvents, nil
 }
 
+// upsertStreamTx is used for upserting a stream as part of an existing transaction.
+// the caller is responsible for obtaining a lock on the database and managing the transaction
+// lifecycle.
+func (s *Service) upsertStreamTx(ctx context.Context, tx *sqlx.Tx, orgID platform.ID, stream influxdb.Stream) (*platform.ID, error) {
+	upsertQuery := `
+		INSERT INTO streams(id, org_id, name, description, created_at, updated_at)
+		VALUES(:id, :org_id, :name, :description, :created_at, :updated_at)
+		ON CONFLICT(org_id, name) DO 
+			UPDATE SET %s
+			WHERE org_id = :org_id AND name = :name
+		RETURNING id`
+
+	setStr := "updated_at = :updated_at"
+	if len(stream.Description) > 0 {
+		setStr += ",description = :description"
+	}
+	upsertQuery = fmt.Sprintf(upsertQuery, setStr)
+
+	stmt, err := tx.PrepareNamedContext(ctx, upsertQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	nowTime := time.Now().UTC()
+	newID := s.idGenerator.ID()
+
+	var id platform.ID
+	if err := stmt.GetContext(ctx, &id, influxdb.StoredStream{
+		ID:          newID,
+		OrgID:       orgID,
+		Name:        stream.Name,
+		Description: stream.Description,
+		CreatedAt:   nowTime,
+		UpdatedAt:   nowTime,
+	}); err != nil {
+		return nil, err
+	}
+
+	return &id, nil
+}
+
+// ListAnnotations returns a list of annotations from the database matching the filter.
+// For time range matching, sqlite is able to compare times with millisecond accuracy.
 func (s *Service) ListAnnotations(ctx context.Context, orgID platform.ID, filter influxdb.AnnotationListFilter) ([]influxdb.StoredAnnotation, error) {
+	query := `
+		SELECT id, org_id, stream_id, name, summary, message, stickers, duration, lower, upper
+		FROM ANNOTATIONS
+		WHERE 
+			lower >= ? AND upper <= ?`
 
+	sf := filter.StartTime.Format(time.RFC3339Nano)
+	ef := filter.EndTime.Format(time.RFC3339Nano)
+	args := []interface{}{sf, ef}
 
-	return nil, nil
+	if len(filter.StreamIncludes) > 0 {
+		query += ` AND name IN (?)`
+		for _, s := range filter.StreamIncludes {
+			args = append(args, s)
+		}
+
+		var err error
+		query, args, err = sqlx.In(query, args...)
+		if err != nil {
+			return nil, err
+		}
+		query = s.store.DB.Rebind(query)
+	}
+
+	ans := []influxdb.StoredAnnotation{}
+	if err := s.store.DB.SelectContext(ctx, &ans, query, args...); err != nil {
+		return nil, err
+	}
+
+	return filterAnnsByStickers(ans, filter.StickerIncludes)
+}
+
+func filterAnnsByStickers(ans []influxdb.StoredAnnotation, sticks influxdb.AnnotationStickers) ([]influxdb.StoredAnnotation, error) {
+	r := []influxdb.StoredAnnotation{}
+
+	for _, a := range ans {
+		exclude := false
+		for key, val := range sticks {
+			if a.Stickers[key] != val {
+				exclude = true
+				break
+			}
+		}
+		if !exclude {
+			r = append(r, a)
+		}
+	}
+
+	return r, nil
 }
 
 func (s *Service) GetAnnotation(ctx context.Context, id platform.ID) (*influxdb.StoredAnnotation, error) {
@@ -202,7 +268,6 @@ func (s *Service) ListStreams(ctx context.Context, orgID platform.ID, filter inf
 		return s.listStreamsFromQueryAndArgs(ctx, query, orgID)
 	}
 
-	// note the leading space in this string, this is required!
 	query += ` AND name IN (?)`
 	query, args, err := sqlx.In(query, orgID, filter.StreamIncludes)
 	if err != nil {
@@ -249,44 +314,28 @@ func (s *Service) CreateOrUpdateStream(ctx context.Context, orgID platform.ID, s
 	s.store.Mu.Lock()
 	defer s.store.Mu.Unlock()
 
-	upsertQuery := `
-		INSERT INTO streams(id, org_id, name, description, created_at, updated_at)
-		VALUES(:id, :org_id, :name, :description, :created_at, :updated_at)
-		ON CONFLICT(org_id, name) DO 
-			UPDATE SET %s
-			WHERE org_id = :org_id AND name = :name
-		RETURNING id`
-
-	setStr := "updated_at = :updated_at"
-	if len(stream.Description) > 0 {
-		setStr += ",description = :description"
-	}
-	upsertQuery = fmt.Sprintf(upsertQuery, setStr)
-
-	stmt, err := s.store.DB.PrepareNamedContext(ctx, upsertQuery)
+	// a tx isn't strictly needed here, but using it for the query allows the upsert method
+	// to be shared with other functions that need a transaction
+	tx, err := s.store.DB.BeginTxx(ctx, nil)
 	if err != nil {
+		tx.Rollback()
 		return nil, err
 	}
 
-	nowTime := time.Now().UTC()
-	newID := s.idGenerator.ID()
+	id, err := s.upsertStreamTx(ctx, tx, orgID, stream)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
 
-	var id platform.ID
-	if err := stmt.GetContext(ctx, &id, influxdb.StoredStream{
-		ID:          newID,
-		OrgID:       orgID,
-		Name:        stream.Name,
-		Description: stream.Description,
-		CreatedAt:   nowTime,
-		UpdatedAt:   nowTime,
-	}); err != nil {
+	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
 
 	// do a separate query to get the resulting record from the db.
 	// this is necessary because scanning strings from the db into time.Time types
 	// from the RETURNING clause does not work, but scanning them with a SELECT does.
-	return s.getReadStream(ctx, id)
+	return s.getReadStream(ctx, *id)
 }
 
 // UpdateStream updates a stream name and or description. Inputs should be validated prior to call.
